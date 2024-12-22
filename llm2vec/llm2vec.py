@@ -60,7 +60,7 @@ class LLM2Vec(nn.Module):
         self.doc_max_length = doc_max_length
         self.config = model.config
 
-        # 새로운 풀링 모드 초기화
+        # initialize new pooling methods
         if self.pooling_mode == "last_layers_trainable_pooling":
             if pooling_params is None:
                 pooling_params = {}
