@@ -27,9 +27,9 @@ from .models import (
     GemmaBiModel,
     Qwen2BiModel,
 )
+from .models.pooling import PerceiverResampler 
 
 logger = logging.getLogger(__name__)
-
 
 def batch_to_device(batch, target_device: device):
     """
@@ -40,7 +40,6 @@ def batch_to_device(batch, target_device: device):
             batch[key] = batch[key].to(target_device)
     return batch
 
-
 class LLM2Vec(nn.Module):
     def __init__(
         self,
@@ -50,6 +49,7 @@ class LLM2Vec(nn.Module):
         max_length: int = 512,
         doc_max_length: int = 400,
         skip_instruction: bool = True,
+        pooling_params: Dict = None,  # parameter for trainable pooling
     ):
         super().__init__()
         self.model = model
@@ -59,6 +59,14 @@ class LLM2Vec(nn.Module):
         self.max_length = max_length
         self.doc_max_length = doc_max_length
         self.config = model.config
+
+        # 새로운 풀링 모드 초기화
+        if self.pooling_mode == "last_layers_trainable_pooling":
+            if pooling_params is None:
+                pooling_params = {}
+            self.pooling = PerceiverResampler(**pooling_params)
+        else:
+            self.pooling = None  # original pooling methods are handled by get_pooling
 
     @classmethod
     def _get_model_class(cls, config_class_name, enable_bidirectional):
@@ -84,6 +92,8 @@ class LLM2Vec(nn.Module):
         peft_model_name_or_path=None,
         merge_peft=False,
         enable_bidirectional=True,
+        pooling_mode: str = "mean",  # parameter for trainable pooling
+        pooling_params: Dict = None,  # parameter for trainable pooling
         **kwargs,
     ):
         # pop out encoder args
@@ -142,7 +152,26 @@ class LLM2Vec(nn.Module):
         for key, value in encoder_args.items():
             config[key] = value
 
-        return cls(model=model, tokenizer=tokenizer, **config)
+        # settings for pooling modes
+        config["pooling_mode"] = pooling_mode
+        config["pooling_params"] = pooling_params if pooling_params is not None else {}
+
+        # Initialize LLM2Vec instance
+        llm2vec_instance = cls(
+            model=model,
+            tokenizer=tokenizer,
+            pooling_mode=pooling_mode,
+            pooling_params=pooling_params,
+            **config
+        )
+
+        # Load pooling state if applicable
+        if pooling_mode == "last_layers_trainable_pooling":
+            pooling_path = os.path.join(base_model_name_or_path, "pooling", "state_dict.pt")
+            if os.path.exists(pooling_path):
+                llm2vec_instance.pooling.load_state_dict(torch.load(pooling_path))
+
+        return llm2vec_instance
 
     def prepare_for_tokenization(self, text):
         if self.model.config._name_or_path == "meta-llama/Meta-Llama-3-8B-Instruct":
@@ -236,9 +265,13 @@ class LLM2Vec(nn.Module):
         reps = self.model(**sentence_feature)
         sentence_feature["embed_mask"] = embed_mask
 
-        return self.get_pooling(sentence_feature, reps.last_hidden_state)
+        if self.pooling_mode == "last_layers_trainable_pooling":
+            # applying new pooling method
+            return self.pooling(reps.last_hidden_state)
+        else:
+            return self.get_pooling(sentence_feature, reps.last_hidden_state)
 
-    def get_pooling(self, features, last_hidden_states):  # All models padded from left
+    def get_pooling(self, features, last_hidden_states):  # 기존 코드 유지
         assert (
             self.tokenizer.padding_side == "left"
         ), "Pooling modes are implemented for padding from left."
@@ -325,7 +358,6 @@ class LLM2Vec(nn.Module):
             multiprocessing as currently implemented.
 
         Returns: embeddings of the sentences. Embeddings are detached and always on the CPU (see _encode implementation).
-
         """
         if isinstance(sentences[0], str) and isinstance(sentences[-1], int):
             sentences = [sentences]
@@ -418,6 +450,12 @@ class LLM2Vec(nn.Module):
 
         self.model.save_pretrained(output_path)
         self.tokenizer.save_pretrained(output_path)
+
+        # Save pooling module if applicable
+        if self.pooling_mode == "last_layers_trainable_pooling":
+            pooling_path = os.path.join(output_path, "pooling")
+            os.makedirs(pooling_path, exist_ok=True)
+            torch.save(self.pooling.state_dict(), os.path.join(pooling_path, "state_dict.pt"))
 
         llm2vec_config = {
             "pooling_mode": self.pooling_mode,
