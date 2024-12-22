@@ -271,7 +271,7 @@ class LLM2Vec(nn.Module):
         else:
             return self.get_pooling(sentence_feature, reps.last_hidden_state)
 
-    def get_pooling(self, features, last_hidden_states):  # 기존 코드 유지
+    def get_pooling(self, features, last_hidden_states):  # All models padded from left
         assert (
             self.tokenizer.padding_side == "left"
         ), "Pooling modes are implemented for padding from left."
