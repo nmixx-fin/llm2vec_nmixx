@@ -6,7 +6,7 @@ import math
 import os
 import sys
 import warnings
-import shutil
+import shutil  # 파일 조작을 위해 추가
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional, Any, Tuple, List
@@ -43,6 +43,7 @@ from llm2vec.models import (
     Qwen2BiForMNTP,
 )
 
+# Check minimal version requirement
 require_version(
     "datasets>=1.8.0",
     "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt",
@@ -51,6 +52,7 @@ require_version(
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
 
 def get_model_class(config):
     config_class_name = config.__class__.__name__
@@ -64,6 +66,7 @@ def get_model_class(config):
         return Qwen2BiForMNTP
     else:
         raise ValueError(f"Model class {config_class_name} not supported.")
+
 
 def initialize_peft(
     model,
@@ -103,6 +106,7 @@ def initialize_peft(
     print(f"Model's Lora trainable parameters:")
     model.print_trainable_parameters()
     return model
+
 
 @dataclass
 class ModelArguments:
@@ -224,6 +228,7 @@ class ModelArguments:
                 "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
             )
 
+
 @dataclass
 class DataTrainingArguments:
     """
@@ -339,6 +344,7 @@ class DataTrainingArguments:
                         "`validation_file` should be a csv, a json or a txt file."
                     )
 
+
 @dataclass
 class CustomArguments:
     """
@@ -364,6 +370,7 @@ class CustomArguments:
         default="default",
         metadata={"help": "The type of data collator. Options: default, all_mask"},
     )
+
 
 class DataCollatorForLanguageModelingWithFullMasking(DataCollatorForLanguageModeling):
     def torch_mask_tokens(
@@ -401,6 +408,7 @@ class DataCollatorForLanguageModelingWithFullMasking(DataCollatorForLanguageMode
 
         return inputs, labels
 
+
 class StopTrainingCallback(TrainerCallback):
     def __init__(self, stop_after_n_steps: int):
         self.stop_after_n_steps = stop_after_n_steps
@@ -408,6 +416,7 @@ class StopTrainingCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step >= self.stop_after_n_steps:
             control.should_training_stop = True
+
 
 class MNTPTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -432,6 +441,7 @@ class MNTPTrainer(Trainer):
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
 
 class CustomCheckpointCallback(TrainerCallback):
     """
@@ -465,7 +475,7 @@ class CustomCheckpointCallback(TrainerCallback):
                 args=TrainingArguments(
                     output_dir=desired_checkpoint_dir,
                     push_to_hub=True,
-                    hub_model_id=f"{self.hub_model_id}/{desired_checkpoint_name}",
+                    hub_model_id=self.hub_model_id,  # 수정된 부분
                     hub_token=self.hub_token,
                     logging_dir=os.path.join(desired_checkpoint_dir, "logs"),
                     save_strategy="no",  # 추가 저장 방지
@@ -473,11 +483,12 @@ class CustomCheckpointCallback(TrainerCallback):
                 tokenizer=kwargs["tokenizer"],
             )
             push_trainer.push_to_hub(commit_message=f"Checkpoint at step {state.global_step}")
-            logger.info(f"Checkpoint pushed to HuggingFace Hub: {self.hub_model_id}/{desired_checkpoint_name}")
+            logger.info(f"Checkpoint pushed to HuggingFace Hub: {self.hub_model_id}")
         except Exception as e:
             logger.error(f"Failed to push checkpoint to HuggingFace Hub: {e}")
 
         return control
+
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -759,7 +770,7 @@ def main():
         padding = "max_length" if data_args.pad_to_max_length else False
 
         def tokenize_function(examples):
-            # Remove empty lines
+            # Remove empty lines and ensure all entries are strings
             examples[text_column_name] = [
                 line
                 for line in examples[text_column_name]
@@ -775,8 +786,8 @@ def main():
                 padding=padding,
                 truncation=True,
                 max_length=max_seq_length,
-                # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                # receives the `special_tokens_mask`.
+                # We use this option because DataCollatorForLanguageModeling (see below) is more
+                # efficient when it receives the `special_tokens_mask`.
                 return_special_tokens_mask=True,
             )
 
@@ -1024,6 +1035,7 @@ def main():
 
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)
+
 
 if __name__ == "__main__":
     main()
