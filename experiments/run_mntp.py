@@ -1,17 +1,15 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright ...
 
 import logging
 import math
 import os
 import sys
 import warnings
-import shutil  # 파일 조작을 위해 추가
+import shutil
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional, Any, Tuple, List
-import numpy as np
 
 import datasets
 import evaluate
@@ -45,9 +43,6 @@ from llm2vec.models import (
     Qwen2BiForMNTP,
 )
 
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-# check_min_version("4.38.0.dev0")
-
 require_version(
     "datasets>=1.8.0",
     "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt",
@@ -56,7 +51,6 @@ require_version(
 logger = logging.getLogger(__name__)
 MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
-
 
 def get_model_class(config):
     config_class_name = config.__class__.__name__
@@ -70,7 +64,6 @@ def get_model_class(config):
         return Qwen2BiForMNTP
     else:
         raise ValueError(f"Model class {config_class_name} not supported.")
-
 
 def initialize_peft(
     model,
@@ -110,7 +103,6 @@ def initialize_peft(
     print(f"Model's Lora trainable parameters:")
     model.print_trainable_parameters()
     return model
-
 
 @dataclass
 class ModelArguments:
@@ -173,7 +165,7 @@ class ModelArguments:
         },
     )
     token: str = field(
-        default='',  # 사용자 제공 토큰
+        default=os.getenv('HF_TOKEN'),  # 환경 변수에서 토큰을 가져옵니다
         metadata={
             "help": (
                 "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
@@ -231,7 +223,6 @@ class ModelArguments:
             raise ValueError(
                 "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
             )
-
 
 @dataclass
 class DataTrainingArguments:
@@ -348,7 +339,6 @@ class DataTrainingArguments:
                         "`validation_file` should be a csv, a json or a txt file."
                     )
 
-
 @dataclass
 class CustomArguments:
     """
@@ -374,7 +364,6 @@ class CustomArguments:
         default="default",
         metadata={"help": "The type of data collator. Options: default, all_mask"},
     )
-
 
 class DataCollatorForLanguageModelingWithFullMasking(DataCollatorForLanguageModeling):
     def torch_mask_tokens(
@@ -412,7 +401,6 @@ class DataCollatorForLanguageModelingWithFullMasking(DataCollatorForLanguageMode
 
         return inputs, labels
 
-
 class StopTrainingCallback(TrainerCallback):
     def __init__(self, stop_after_n_steps: int):
         self.stop_after_n_steps = stop_after_n_steps
@@ -420,7 +408,6 @@ class StopTrainingCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step >= self.stop_after_n_steps:
             control.should_training_stop = True
-
 
 class MNTPTrainer(Trainer):
     def __init__(self, *args, **kwargs):
@@ -445,7 +432,6 @@ class MNTPTrainer(Trainer):
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
-
 
 class CustomCheckpointCallback(TrainerCallback):
     """
@@ -492,7 +478,6 @@ class CustomCheckpointCallback(TrainerCallback):
             logger.error(f"Failed to push checkpoint to HuggingFace Hub: {e}")
 
         return control
-
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -653,14 +638,7 @@ def main():
                 token=model_args.token,
             )
 
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.
-
     # Load pretrained model and tokenizer
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
@@ -702,7 +680,7 @@ def main():
             "You can do it from another script, save it, and load it from here, using --tokenizer_name."
         )
 
-    # blank, eos, mask
+    # Set mask token
     if tokenizer.mask_token is None:
         if custom_args.mask_token_type == "blank":
             tokenizer.mask_token = "_"
@@ -719,7 +697,7 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Loading bidirectional model using LLM2Vec package
+    # Load model
     model_class = get_model_class(config)
     torch_dtype = (
         model_args.torch_dtype
@@ -739,7 +717,7 @@ def main():
         attn_implementation=model_args.attn_implementation,
     )
 
-    # model organization is MODEL_TYPEBiForMNTP.model -> MODEL_TYPELBiModel, we have to apply PEFT to the inner model
+    # Apply PEFT
     model.model = initialize_peft(
         model.model,
         lora_r=custom_args.lora_r,
@@ -747,14 +725,12 @@ def main():
         lora_dropout=custom_args.lora_dropout,
     )
 
-    # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
+    # Resize embeddings if necessary
     embedding_size = model.get_input_embeddings().weight.shape[0]
     if len(tokenizer) > embedding_size:
         model.resize_token_embeddings(len(tokenizer))
 
     # Preprocessing the datasets.
-    # First we tokenize all the texts.
     if training_args.do_train:
         column_names = list(raw_datasets["train"].features)
     else:
@@ -787,10 +763,15 @@ def main():
             examples[text_column_name] = [
                 line
                 for line in examples[text_column_name]
-                if len(line) > 0 and not line.isspace()
+                if isinstance(line, str) and len(line.strip()) > 0
             ]
+            texts = examples[text_column_name]
+            if isinstance(texts, list):
+                texts = [str(t) for t in texts]
+            else:
+                texts = [str(texts)]
             return tokenizer(
-                examples[text_column_name],
+                texts,
                 padding=padding,
                 truncation=True,
                 max_length=max_seq_length,
@@ -820,8 +801,13 @@ def main():
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
         # efficient when it receives the `special_tokens_mask`.
         def tokenize_function(examples):
+            texts = examples[text_column_name]
+            if isinstance(texts, list):
+                texts = [str(t) if t is not None else "" for t in texts]
+            else:
+                texts = [str(texts)] if texts is not None else [""]
             return tokenizer(
-                examples[text_column_name], return_special_tokens_mask=True
+                texts, return_special_tokens_mask=True
             )
 
         with training_args.main_process_first(desc="dataset map tokenization"):
@@ -1038,7 +1024,6 @@ def main():
 
     if training_args.push_to_hub:
         trainer.push_to_hub(**kwargs)
-
 
 if __name__ == "__main__":
     main()
