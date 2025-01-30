@@ -965,7 +965,7 @@ def main():
     # Define your HuggingFace Hub repository name
     # Extract the base model name for naming
     base_model_name = os.path.basename(model_args.model_name_or_path).replace('/', '-')
-    hub_model_id = f"albertmade/nmixx-{base_model_name}"
+    hub_model_id = f"Albertmade/nmixx-{base_model_name}"
     hub_token = model_args.token  # HuggingFace 토큰 사용
 
     # Add custom checkpoint callback
