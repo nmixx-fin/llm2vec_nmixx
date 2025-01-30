@@ -1,27 +1,13 @@
 #!/usr/bin/env python
 # coding=utf-8
-# Copyright 2020 The HuggingFace Team All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-The script is adapted from https://github.com/huggingface/transformers/blob/51bcadc10a569847b93a30dbe3a077037ae63bad/examples/pytorch/language-modeling/run_mlm.py
-"""
+# Copyright ...
 
 import logging
 import math
 import os
 import sys
 import warnings
+import shutil  # 파일 조작을 위해 추가
 from dataclasses import dataclass, field
 from itertools import chain
 from typing import Optional, Any, Tuple, List
@@ -187,7 +173,7 @@ class ModelArguments:
         },
     )
     token: str = field(
-        default=None,
+        default='',  # 사용자 제공 토큰
         metadata={
             "help": (
                 "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
@@ -363,7 +349,6 @@ class DataTrainingArguments:
                     )
 
 
-# add more arguments
 @dataclass
 class CustomArguments:
     """
@@ -460,6 +445,53 @@ class MNTPTrainer(Trainer):
 
         # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
+
+
+class CustomCheckpointCallback(TrainerCallback):
+    """
+    Custom callback to rename checkpoints and push them to the HuggingFace Hub with the desired naming convention.
+    """
+
+    def __init__(self, hub_model_id: str, hub_token: str, model_name: str):
+        self.hub_model_id = hub_model_id
+        self.hub_token = hub_token
+        self.model_name = model_name
+
+    def on_save(self, args, state, control, **kwargs):
+        # 기존 체크포인트 경로
+        checkpoint_dir = kwargs.get("checkpoint")
+        if checkpoint_dir is None:
+            checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+
+        # 원하는 체크포인트 이름
+        desired_checkpoint_name = f"nmixx-{self.model_name}-{state.global_step}"
+        desired_checkpoint_dir = os.path.join(args.output_dir, desired_checkpoint_name)
+
+        # 체크포인트 디렉토리 이름 변경
+        shutil.move(checkpoint_dir, desired_checkpoint_dir)
+        logger.info(f"Checkpoint renamed to {desired_checkpoint_dir}")
+
+        # 체크포인트를 HuggingFace Hub에 업로드
+        try:
+            # Trainer 인스턴스를 새로 초기화하여 체크포인트를 업로드
+            push_trainer = Trainer(
+                model=kwargs["model"],
+                args=TrainingArguments(
+                    output_dir=desired_checkpoint_dir,
+                    push_to_hub=True,
+                    hub_model_id=f"{self.hub_model_id}/{desired_checkpoint_name}",
+                    hub_token=self.hub_token,
+                    logging_dir=os.path.join(desired_checkpoint_dir, "logs"),
+                    save_strategy="no",  # 추가 저장 방지
+                ),
+                tokenizer=kwargs["tokenizer"],
+            )
+            push_trainer.push_to_hub(commit_message=f"Checkpoint at step {state.global_step}")
+            logger.info(f"Checkpoint pushed to HuggingFace Hub: {self.hub_model_id}/{desired_checkpoint_name}")
+        except Exception as e:
+            logger.error(f"Failed to push checkpoint to HuggingFace Hub: {e}")
+
+        return control
 
 
 def main():
@@ -933,6 +965,21 @@ def main():
         ),
     )
 
+    # Define your HuggingFace Hub repository name
+    # Extract the base model name for naming
+    base_model_name = os.path.basename(model_args.model_name_or_path).replace('/', '-')
+    hub_model_id = f"albertmade/nmixx-{base_model_name}"
+    hub_token = model_args.token  # HuggingFace 토큰 사용
+
+    # Add custom checkpoint callback
+    checkpoint_callback = CustomCheckpointCallback(
+        hub_model_id=hub_model_id,
+        hub_token=hub_token,
+        model_name=base_model_name,
+    )
+    trainer.add_callback(checkpoint_callback)
+
+    # Add the StopTrainingCallback
     trainer.add_callback(StopTrainingCallback(custom_args.stop_after_n_steps))
 
     # Training
