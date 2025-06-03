@@ -240,33 +240,92 @@ class KananaTripletTrainer(Trainer):
             self.instruction_token_len = 0
             logger.info("No instruction text provided, instruction token length is 0.")
 
-    def compute_loss(self, model: Union[Kanana2VecModel, PeftModel], inputs: Dict[str, Dict[str, torch.Tensor]], return_outputs=False):
-        # PEFT 적용 시 model은 PeftModel 래퍼일 수 있음. 실제 Kanana2VecModel은 model.base_model.model 또는 model.model
-        actual_model = model.base_model.model if isinstance(model, PeftModel) and hasattr(model.base_model, 'model') else \
-                       (model.model if hasattr(model, 'model') else model)
+
+    def compute_loss(self, model: Union[torch.nn.Module, PeftModel], inputs: Dict[str, Dict[str, torch.Tensor]], return_outputs=False, **kwargs):
+        logger.info(f"compute_loss: type(model) = {type(model)}")
+        logger.info(f"compute_loss: type(self.model) = {type(self.model)}")
+        if hasattr(model, 'module'):
+            logger.info(f"compute_loss: type(model.module) = {type(model.module)}")
+        if isinstance(self.model, PeftModel):
+            logger.info(f"compute_loss: type(self.model.base_model) = {type(self.model.base_model)}")
+            if hasattr(self.model.base_model, 'model'):
+                logger.info(f"compute_loss: type(self.model.base_model.model) = {type(self.model.base_model.model)}")
+        # 'model' 인자는 Trainer의 training_step에서 전달되며, DDP 등으로 래핑된 모델일 수 있음.
+        # 실제 forward pass에는 이 'model' 인자를 사용해야 함.
+
+        # Kanana2VecModel 고유의 헬퍼 메서드를 사용하기 위해 원본 Kanana2VecModel 인스턴스를 가져옴.
         
-        if not isinstance(actual_model, Kanana2VecModel):
-             logger.error(f"The model passed to compute_loss is not a Kanana2VecModel or expected PEFT-wrapped Kanana2VecModel. Type: {type(actual_model)}")
-             # 적절한 예외 처리 또는 기본 동작
-             # return torch.tensor(0.0, device=self.args.device) # 예시
+        # 1. DDP 래퍼 벗기기 (model 인자로부터)
+        model_for_forward_unwrapped = model.module if hasattr(model, 'module') else model # forward pass에 사용될 기본 모델 (PeftModel or Kanana2VecModel)
+        
+        # 2. 헬퍼 메서드용 Kanana2VecModel 인스턴스 가져오기
+        # self.model은 Trainer 초기화 시 전달된 모델 (PeftModel(Kanana2VecModel) 또는 Kanana2VecModel)
+        temp_model_for_helpers = self.model # Trainer가 __init__에서 받은 모델
+        if hasattr(temp_model_for_helpers, 'module'): # 만약 self.model도 DDP 래핑되어 있다면 (일반적이지 않음)
+            temp_model_for_helpers = temp_model_for_helpers.module
 
+        if isinstance(temp_model_for_helpers, PeftModel):
+            # PeftModel의 base_model은 LoraModel 등을 반환하고, 그 내부의 model이 원본 Kanana2VecModel
+            if hasattr(temp_model_for_helpers.base_model, 'model') and \
+               isinstance(temp_model_for_helpers.base_model.model, Kanana2VecModel):
+                kanana_model_instance = temp_model_for_helpers.base_model.model
+            # 또는 PeftModel이 Kanana2VecModel을 직접 감싼 경우 (base_model이 Kanana2VecModel)
+            elif isinstance(temp_model_for_helpers.base_model, Kanana2VecModel):
+                 kanana_model_instance = temp_model_for_helpers.base_model
+            else:
+                raise TypeError(f"PEFT base model (type: {type(temp_model_for_helpers.base_model)}) or its inner model is not Kanana2VecModel.")
+        elif isinstance(temp_model_for_helpers, Kanana2VecModel):
+            kanana_model_instance = temp_model_for_helpers # PEFT가 적용되지 않은 경우
+        else:
+            raise TypeError(f"self.model (type: {type(temp_model_for_helpers)}) is not PeftModel or Kanana2VecModel.")
+
+        # --- 필수 속성/메서드 검사 ---
+        # Kanana2VecModel 인스턴스가 맞는지 한번 더 확인 (필수 메서드 존재 여부로)
+        # 여기서 kanana_model_instance는 순수 Kanana2VecModel 이어야 함.
+        if not hasattr(kanana_model_instance, 'tokenizer'):
+            # main에서 model.tokenizer = tokenizer 할당이 PEFT 적용 전에 이루어짐.
+            # PEFT 적용 후에는 peft_model.base_model.model.tokenizer 로 접근해야 할 수 있음.
+            # 또는, Trainer가 초기화될 때 tokenizer를 별도로 가지고 있으므로 self.tokenizer 사용도 가능.
+            # 여기서는 kanana_model_instance에 tokenizer가 이미 할당되어 있다고 가정.
+            # 만약 여기서 None이라면, _calculate_instruction_token_len 내부에서 tokenizer를 self.tokenizer로 대체해야 함.
+             logger.warning(f"kanana_model_instance (type: {type(kanana_model_instance)}) does not have 'tokenizer' attribute. "
+                           "Instruction length calculation might use Trainer's tokenizer.")
+        
+        if not (hasattr(kanana_model_instance, 'prepare_kwargs_from_batch') and \
+                hasattr(kanana_model_instance, 'format_instruction')):
+            # 위에서 tokenizer 검사는 별도로 하고, 여기서는 핵심 메서드만 확인
+            raise TypeError(f"The obtained model instance for helpers (type: {type(kanana_model_instance)}) "
+                            "does not have 'prepare_kwargs_from_batch' or 'format_instruction'.")
+        # --- 검사 끝 ---
+
+        # instruction 토큰 길이 계산 (필요시)
         if self.instruction_token_len == 0 and self.instruction_text_for_len:
-             self._calculate_instruction_token_len(tokenizer=actual_model.tokenizer, model_for_format=actual_model)
-
-
-        device = next(actual_model.parameters()).device
+             self._calculate_instruction_token_len(
+                 tokenizer=(kanana_model_instance.tokenizer if hasattr(kanana_model_instance, 'tokenizer') and kanana_model_instance.tokenizer else self.tokenizer), # 안전하게 접근
+                 model_for_format=kanana_model_instance
+             )
+        
+        device = next(model.parameters()).device # forward pass용 모델의 device 사용
 
         source_batch = {k: v.to(device) for k, v in inputs["source"].items()}
         positive_batch = {k: v.to(device) for k, v in inputs["positive"].items()}
         negative_batch = {k: v.to(device) for k, v in inputs["negative"].items()}
         
-        source_features = actual_model.prepare_kwargs_from_batch(source_batch, instruction_lens=self.instruction_token_len, device=device)
-        positive_features = actual_model.prepare_kwargs_from_batch(positive_batch, instruction_lens=0, device=device) 
-        negative_features = actual_model.prepare_kwargs_from_batch(negative_batch, instruction_lens=0, device=device)
+        source_features = kanana_model_instance.prepare_kwargs_from_batch(source_batch, instruction_lens=self.instruction_token_len, device=device)
+        positive_features = kanana_model_instance.prepare_kwargs_from_batch(positive_batch, instruction_lens=0, device=device) 
+        negative_features = kanana_model_instance.prepare_kwargs_from_batch(negative_batch, instruction_lens=0, device=device)
 
-        source_emb = actual_model(**source_features).embedding
-        positive_emb = actual_model(**positive_features).embedding
-        negative_emb = actual_model(**negative_features).embedding
+        # 실제 forward pass는 Trainer가 전달한 'model' (DDP/PEFT 래핑된)을 사용
+        source_emb_output = model(**source_features)
+        positive_emb_output = model(**positive_features)
+        negative_emb_output = model(**negative_features)
+
+        if not (hasattr(source_emb_output, 'embedding') and hasattr(positive_emb_output, 'embedding') and hasattr(negative_emb_output, 'embedding')):
+            raise AttributeError("The model's forward pass did not return an output object with an 'embedding' attribute.")
+
+        source_emb = source_emb_output.embedding
+        positive_emb = positive_emb_output.embedding
+        negative_emb = negative_emb_output.embedding
 
         loss = self.triplet_loss(source_emb, positive_emb, negative_emb)
         

@@ -33,7 +33,7 @@
     "fp16": false, 
     "bf16": true, 
     "seed": 42,
-    "report_to": "tensorboard", 
+    "remove_unused_columns": false,
     "dataloader_num_workers": 4,
     "ddp_find_unused_parameters": false,
 
