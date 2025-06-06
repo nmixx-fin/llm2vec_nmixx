@@ -18,6 +18,7 @@ from transformers import (
     Trainer,
 )
 from peft import LoraConfig, get_peft_model
+from tqdm.auto import tqdm
 
 from accelerate.logging import get_logger
 from llm2vec import LLM2Vec
@@ -131,6 +132,8 @@ class CustomArguments:
 
     lora_r: int = field(default=8, metadata={"help": "The r value for lora"})
 
+    lora_alpha: int = field(default=16, metadata={"help": "The alpha value for lora"})
+
     stop_after_n_steps: int = field(
         default=10000, metadata={"help": "Stop training after n steps"}
     )
@@ -160,23 +163,9 @@ class DataSample:
 
 
 class TrainSample:
-    """
-    Structure for one input example with texts, the label and a unique id
-    """
-
     def __init__(
         self, guid: str = "", texts: List[str] = None, label: Union[int, float] = 0
     ):
-        """
-        Creates one TrainSample with the given texts, guid and label
-
-        :param guid
-            id for the example
-        :param texts
-            the texts for the example.
-        :param label
-            the label for the example
-        """
         self.guid = guid
         self.texts = texts
         self.label = label
@@ -187,12 +176,46 @@ class StopTrainingCallback(TrainerCallback):
         self.stop_after_n_steps = stop_after_n_steps
 
     def on_train_begin(self, args, state, control, **kwargs):
-        """학습 시작 시 호출되는 메소드"""
         return control
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step >= self.stop_after_n_steps:
             control.should_training_stop = True
+        return control
+
+
+class ProgressCallback(TrainerCallback):
+    def __init__(self):
+        self.progress_bar = None
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        total_steps = (
+            state.max_steps
+            if state.max_steps > 0
+            else args.num_train_epochs * len(kwargs.get("train_dataloader", []))
+        )
+        self.progress_bar = tqdm(
+            total=total_steps,
+            desc="Training",
+            unit="step",
+            dynamic_ncols=True,
+            leave=True,
+        )
+        return control
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if self.progress_bar:
+            logs = kwargs.get("logs", {})
+            loss = logs.get("loss", 0.0)
+            lr = logs.get("learning_rate", 0.0)
+            desc = f"Training - Loss: {loss:.4f}, LR: {lr:.2e}"
+            self.progress_bar.set_description(desc)
+            self.progress_bar.update(1)
+        return control
+
+    def on_train_end(self, args, state, control, **kwargs):
+        if self.progress_bar:
+            self.progress_bar.close()
         return control
 
 
@@ -209,25 +232,16 @@ class BaseSupervisedTrainer:
     def training_step(
         self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]
     ) -> torch.Tensor:
-        """
-        Perform a training step on a batch of inputs.
-
-        Override the default training_step to handle our specific input format.
-        """
         model.train()
-
-        # 직접 compute_loss를 호출하여 labels가 모델에 전달되는 것을 방지
         loss = self.compute_loss(model, inputs)
 
         if self.args.n_gpu > 1:
-            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+            loss = loss.mean()
 
         if self.args.gradient_accumulation_steps > 1:
             loss = loss / self.args.gradient_accumulation_steps
 
-        # 원래 Trainer의 구현과 유사하게 backward 호출
         self.accelerator.backward(loss)
-
         return loss.detach()
 
     def compute_loss(
@@ -238,7 +252,6 @@ class BaseSupervisedTrainer:
     ) -> Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         features, labels = inputs
 
-        # 입력을 모델의 디바이스로 이동
         device = next(model.parameters()).device
         features = [f.to(device) for f in features]
 
@@ -249,7 +262,6 @@ class BaseSupervisedTrainer:
         if len(features) > 2:
             d_reps_neg = self.model(features[2])
 
-        # 모든 텐서가 같은 디바이스에 있는지 확인
         if d_reps_neg is not None:
             d_reps_neg = d_reps_neg.to(device)
         q_reps = q_reps.to(device)
@@ -266,7 +278,6 @@ class BaseSupervisedTrainer:
         return loss
 
     def get_train_dataloader(self) -> DataLoader:
-        # Copying most of the code from the parent class, changing the sampler to SequentialSampler
         if self.train_dataset is None:
             raise ValueError("Trainer: training requires a train_dataset.")
 
@@ -293,42 +304,40 @@ class BaseSupervisedTrainer:
 
 
 def load_custom_dataset(dataset_name=None, file_path=None, split="train", **kwargs):
-    """
-    Loads a custom dataset from Huggingface Hub or local file.
-
-    Args:
-        dataset_name (str): Name of the dataset to load from Huggingface Hub.
-        file_path (str): Path to the dataset file.
-        split (str): Split of the dataset to load.
-    """
     if dataset_name:
-        # 허깅페이스 데이터셋 로드
         dataset = load_dataset(dataset_name, split=split)
     elif file_path:
-        # 로컬 파일에서 데이터셋 로드
         dataset = load_dataset("json", data_files=file_path, split=split)
     else:
         raise ValueError("Either dataset_name or file_path must be provided.")
 
-    # 데이터셋에 필요한 컬럼이 있는지 확인
-    required_columns = ["query", "positive", "negative"]
+    if dataset_name and "nmixx" in dataset_name.lower():
+        required_columns = ["source_text", "positive", "negative"]
+    else:
+        required_columns = ["query", "positive", "negative"]
+
     for col in required_columns:
         if col not in dataset.column_names:
-            raise ValueError(f"Dataset must contain column '{col}'")
+            raise ValueError(
+                f"Dataset must contain column '{col}'. Available columns: {dataset.column_names}"
+            )
 
-    # DataSample 객체로 변환
     samples = []
     for i, item in enumerate(dataset):
+        if dataset_name and "nmixx" in dataset_name.lower():
+            query_text = item["source_text"]
+        else:
+            query_text = item["query"]
+
         samples.append(
             DataSample(
                 id_=i,
-                query=item["query"],
+                query=query_text,
                 positive=item["positive"],
                 negative=item["negative"],
             )
         )
 
-    # TrainSample 객체로 변환
     train_samples = []
     for sample in samples:
         train_samples.append(
@@ -343,34 +352,25 @@ def load_custom_dataset(dataset_name=None, file_path=None, split="train", **kwar
 
 
 def prepare_for_tokenization(model, text, pooling_mode="mean"):
-    """
-    모델에 따라 입력 텍스트를 적절히 가공합니다.
-    """
-    # BGE 모델
     if model.config._name_or_path == "BAAI/bge-large-en-v1.5":
         text = (
             "Represent this sentence for searching relevant passages: " + text.strip()
         )
-    # Instructor 모델
     elif model.config._name_or_path == "hkunlp/instructor-base":
         text = "Represent the following text for retrieval: " + text.strip()
-    # LLama 3 모델
     elif model.config._name_or_path == "meta-llama/Meta-Llama-3-8B-Instruct":
         text = (
             "<|start_header_id|>user<|end_header_id|>\n\n" + text.strip() + "<|eot_id|>"
         )
-    # Mistral과 Llama 2 모델
     elif model.config._name_or_path in [
         "mistralai/Mistral-7B-Instruct-v0.2",
         "meta-llama/Llama-2-7b-chat-hf",
     ]:
         text = "[INST] " + text.strip() + " [/INST]"
-    # Gemma 모델
     elif model.config._name_or_path in [
         "google/gemma-2-9b-it",
     ]:
         text = "<bos><start_of_turn>user\n" + text.strip() + "<end_of_turn>"
-    # Qwen 모델
     elif model.config._name_or_path in [
         "Qwen/Qwen2-1.5B-Instruct",
         "Qwen/Qwen2-7B-Instruct",
@@ -378,7 +378,6 @@ def prepare_for_tokenization(model, text, pooling_mode="mean"):
     ]:
         text = "<|im_start|>user\n" + text.strip() + "<|im_end|>"
 
-    # pooling_mode가 eos_token인 경우 모델별로 EOS 토큰 추가
     if pooling_mode == "eos_token":
         if model.config._name_or_path == "meta-llama/Meta-Llama-3-8B":
             text = text.strip() + "<|end_of_text|>"
@@ -425,7 +424,7 @@ def initialize_peft(
                 "wi",  # T5 Feed Forward input
                 "wo",  # T5 Feed Forward output
             ]
-        else:  # BGE-Large 등 다른 모델용
+        else:
             lora_modules = [
                 "query",
                 "key",
@@ -443,7 +442,6 @@ def initialize_peft(
     )
 
     model = get_peft_model(model, config)
-    print(f"Model's Lora trainable parameters:")
     model.print_trainable_parameters()
     return model
 
@@ -473,7 +471,6 @@ class DefaultCollator:
         sentence_features = []
         for idx in range(num_texts):
             tokenized = self.model.tokenize(texts[idx])
-            # T5 모델을 위한 decoder_input_ids 추가 (instructor 모델용)
             if (
                 hasattr(self.model.model, "config")
                 and hasattr(self.model.model.config, "_name_or_path")
@@ -483,7 +480,6 @@ class DefaultCollator:
                     and self.model.model.config.is_encoder_decoder
                 )
             ):
-                # Shift input_ids 오른쪽으로 한 칸 이동 (T5 디코더 입력 생성 방식)
                 decoder_input_ids = tokenized["input_ids"].clone()
                 decoder_input_ids = torch.nn.functional.pad(
                     decoder_input_ids[:, :-1], (1, 0), value=0
@@ -501,15 +497,12 @@ class LLM2VecSupervisedTrainer(BaseSupervisedTrainer, Trainer):
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving model checkpoint to {output_dir}")
 
-        # LoRA 어댑터를 원본 모델에 병합
         if hasattr(self.model.model, "merge_and_unload"):
             merged_model = self.model.model.merge_and_unload()
             merged_model.save_pretrained(output_dir)
         else:
-            # 기존 저장 방식
             self.model.model.save_pretrained(output_dir)
 
-        # pooling_mode 설정을 저장
         pooling_mode_path = os.path.join(output_dir, "pooling_mode.txt")
         with open(pooling_mode_path, "w") as f:
             f.write(self.model.pooling_mode)
@@ -517,5 +510,4 @@ class LLM2VecSupervisedTrainer(BaseSupervisedTrainer, Trainer):
         if self.tokenizer is not None:
             self.tokenizer.save_pretrained(output_dir)
 
-        # Good practice: save your training arguments together with the trained model
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))

@@ -27,6 +27,7 @@ from run_supervised_common import (
     DataSample,
     TrainSample,
     StopTrainingCallback,
+    ProgressCallback,
     BaseSupervisedTrainer,
     LLM2VecSupervisedTrainer,
     load_custom_dataset,
@@ -107,7 +108,6 @@ def main():
 
     training_args.output_dir = f"{training_args.output_dir}/{experiment_id}"
 
-    # 커스텀 데이터셋 로드
     train_examples = load_custom_dataset(
         dataset_name=data_args.dataset_name,
         file_path=data_args.dataset_file_path,
@@ -116,7 +116,6 @@ def main():
         * accelerator.num_processes,
     )
 
-    # 최대 샘플 수 제한 (디버깅용)
     if data_args.max_train_samples is not None:
         train_examples = train_examples[: data_args.max_train_samples]
 
@@ -126,7 +125,6 @@ def main():
         else getattr(torch, model_args.torch_dtype)
     )
 
-    # Alibaba-NLP/gte-Qwen2-1.5B-instruct 모델 로드
     model = LLM2Vec.from_pretrained(
         base_model_name_or_path=model_args.model_name_or_path
         or "Alibaba-NLP/gte-Qwen2-1.5B-instruct",
@@ -138,11 +136,10 @@ def main():
         attn_implementation=model_args.attn_implementation,
     )
 
-    # model organization is LLM2VecModel.model -> HF Model, we have to apply PEFT to the inner model
     model.model = initialize_peft(
         model.model,
         lora_r=custom_args.lora_r,
-        lora_alpha=2 * custom_args.lora_r,
+        lora_alpha=custom_args.lora_alpha,
         lora_dropout=custom_args.lora_dropout,
     )
 
@@ -163,6 +160,8 @@ def main():
 
     if custom_args.stop_after_n_steps is not None:
         trainer.add_callback(StopTrainingCallback(custom_args.stop_after_n_steps))
+
+    trainer.add_callback(ProgressCallback())
 
     trainer.train()
 

@@ -105,7 +105,16 @@ class LLM2Vec(nn.Module):
         }
 
         tokenizer = AutoTokenizer.from_pretrained(base_model_name_or_path)
-        tokenizer.pad_token = tokenizer.eos_token
+
+        # 패딩 토큰 설정 추가
+        if tokenizer.pad_token is None:
+            if tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                # 패딩 토큰 직접 추가
+                tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+            config.pad_token_id = tokenizer.pad_token_id
+
         tokenizer.padding_side = "left"
 
         config = AutoConfig.from_pretrained(base_model_name_or_path)
@@ -162,8 +171,8 @@ class LLM2Vec(nn.Module):
         llm2vec_instance = cls(
             model=model,
             tokenizer=tokenizer,
-            pooling_mode=pooling_mode,
-            pooling_params=pooling_params,
+            # pooling_mode=pooling_mode,
+            # pooling_params=pooling_params,
             **config,
         )
 
