@@ -38,5 +38,5 @@
     "seed": 42,
     "remove_unused_columns": false,
     "dataloader_num_workers": 0,
-    "ddp_find_unused_parameters": null
+    "ddp_find_unused_parameters": true
 }

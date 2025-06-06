@@ -3,11 +3,14 @@ import os
 import sys
 import json
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Any, Union
+from typing import Optional, List, Dict, Any
 
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset as TorchDataset
+# Enable anomaly detection to pinpoint any in-place operations during backward
+torch.autograd.set_detect_anomaly(True)
+
 
 from transformers import (
     AutoTokenizer,
@@ -117,6 +120,7 @@ class CustomTrainingArguments:
         default=1.0, metadata={"help": "Margin for TripletMarginLoss"}
     )
 
+
 #############################################
 #   Model & Pooling Module
 #############################################
@@ -125,19 +129,32 @@ class MeanPooling(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, model_output, attention_mask):
-        token_embeddings = model_output[0]
-        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, dim=1)
-        sum_mask = torch.clamp(input_mask_expanded.sum(dim=1), min=1e-9)
-        return sum_embeddings / sum_mask
+    def forward(self, last_hidden_state, attention_mask):
+        """
+        last_hidden_state: (batch_size, seq_len, hidden_dim)
+        attention_mask:     (batch_size, seq_len) - torch.LongTensor
+        """
+        # 1) attention_mask을 float로 변환하고 차원을 늘려서 브로드캐스트만 사용
+        mask = attention_mask.unsqueeze(-1).float()  # (B, S, 1)
+        # 2) 브로드캐스팅: last_hidden_state * mask → (B, S, H)
+        masked_embeddings = last_hidden_state * mask
+        sum_embeddings = masked_embeddings.sum(dim=1)  # (B, H)
+        # 3) mask.sum(dim=1): (B, 1) → 클램프 후 나누기
+        sum_mask = mask.sum(dim=1).clamp(min=1e-9)  # (B, 1)
+        return sum_embeddings / sum_mask  # (B, H)
+
 
 class SentenceTransformerModel(nn.Module):
     def __init__(self, model_name_or_path: str, model_args: ModelArguments):
         super().__init__()
         self.model_args = model_args
 
-        dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32, "auto": "auto"}
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+            "auto": "auto"
+        }
         torch_dtype_value = dtype_map.get(str(model_args.torch_dtype).lower(), "auto")
 
         self.base_model = AutoModel.from_pretrained(
@@ -149,15 +166,28 @@ class SentenceTransformerModel(nn.Module):
         self.pooling = MeanPooling()
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        pooled = self.pooling(outputs, attention_mask)
+        # compute_loss 단계에서 이미 .to(device).clone() 된 텐서들이 들어오므로
+        # 여기서는 추가 복제가 필요 없지만, 안전을 위해 한번 더 클론합니다.
+        input_ids = input_ids.clone()
+        attention_mask = attention_mask.clone()
+
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        last_hidden_state = outputs.last_hidden_state  # (B, S, H)
+
+        pooled = self.pooling(last_hidden_state, attention_mask)
         return pooled
 
     def save_pretrained(self, save_directory: str):
         logger.info(f"Saving SentenceTransformerModel to {save_directory}")
         os.makedirs(save_directory, exist_ok=True)
         self.base_model.save_pretrained(save_directory)
-        with open(os.path.join(save_directory, "sentence_transformer_model_args.json"), "w") as f:
+        with open(
+            os.path.join(save_directory, "sentence_transformer_model_args.json"),
+            "w",
+        ) as f:
             json.dump(self.model_args.__dict__, f, indent=4)
 
 
@@ -187,11 +217,30 @@ class TripletDataCollator:
         negative_texts = [self._prepare_text(str(ex[self.negative_col])) for ex in features]
 
         batch = {
-            "source": self.tokenizer(source_texts, truncation=True, padding="longest", max_length=self.max_length, return_tensors="pt"),
-            "positive": self.tokenizer(positive_texts, truncation=True, padding="longest", max_length=self.max_length, return_tensors="pt"),
-            "negative": self.tokenizer(negative_texts, truncation=True, padding="longest", max_length=self.max_length, return_tensors="pt"),
+            "source": self.tokenizer(
+                source_texts,
+                truncation=True,
+                padding="longest",
+                max_length=self.max_length,
+                return_tensors="pt"
+            ),
+            "positive": self.tokenizer(
+                positive_texts,
+                truncation=True,
+                padding="longest",
+                max_length=self.max_length,
+                return_tensors="pt"
+            ),
+            "negative": self.tokenizer(
+                negative_texts,
+                truncation=True,
+                padding="longest",
+                max_length=self.max_length,
+                return_tensors="pt"
+            ),
         }
         return batch
+
 
 class TripletDataset(TorchDataset):
     def __init__(self, data_args: DataTrainingArguments, cache_dir: Optional[str] = None):
@@ -200,21 +249,31 @@ class TripletDataset(TorchDataset):
 
         logger.info(f"Loading data from Hugging Face dataset: {data_args.dataset_name}")
         raw_dataset: HuggingFaceDataset = load_dataset(
-            data_args.dataset_name, name=data_args.dataset_config_name,
-            split=data_args.train_split_name, cache_dir=cache_dir,
+            data_args.dataset_name,
+            name=data_args.dataset_config_name,
+            split=data_args.train_split_name,
+            cache_dir=cache_dir,
             trust_remote_code=data_args.trust_remote_code_dataset,
         )
         for i in range(len(raw_dataset)):
             self.samples.append(raw_dataset[i])
 
-        if not self.samples: raise ValueError("No data loaded.")
+        if not self.samples:
+            raise ValueError("No data loaded.")
 
-        required_cols = [data_args.source_column, data_args.positive_column, data_args.negative_column]
+        required_cols = [
+            data_args.source_column,
+            data_args.positive_column,
+            data_args.negative_column,
+        ]
         if not all(col in self.samples[0] for col in required_cols):
-            raise ValueError(f"Dataset items must contain keys: {', '.join(required_cols)}. Found: {list(self.samples[0].keys())}")
+            raise ValueError(
+                f"Dataset items must contain keys: {', '.join(required_cols)}. "
+                f"Found: {list(self.samples[0].keys())}"
+            )
 
         if data_args.max_train_samples is not None and data_args.max_train_samples > 0:
-            self.samples = self.samples[:min(data_args.max_train_samples, len(self.samples))]
+            self.samples = self.samples[: min(data_args.max_train_samples, len(self.samples))]
 
         logger.info(f"Loaded {len(self.samples)} training examples.")
 
@@ -240,28 +299,45 @@ class SentenceTransformerTripletTrainer(Trainer):
         self.margin = margin
         self.triplet_loss = nn.TripletMarginLoss(margin=self.margin, p=2, reduction='mean')
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         device = next(model.parameters()).device
-        source_emb = model(input_ids=inputs["source"]["input_ids"].to(device), attention_mask=inputs["source"]["attention_mask"].to(device))
-        positive_emb = model(input_ids=inputs["positive"]["input_ids"].to(device), attention_mask=inputs["positive"]["attention_mask"].to(device))
-        negative_emb = model(input_ids=inputs["negative"]["input_ids"].to(device), attention_mask=inputs["negative"]["attention_mask"].to(device))
+
+        # GPU에 올린 뒤 즉시 clone() 처리해 완전히 분리된 텐서를 사용
+        src_ids = inputs["source"]["input_ids"].to(device).clone()
+        src_mask = inputs["source"]["attention_mask"].to(device).clone()
+        pos_ids = inputs["positive"]["input_ids"].to(device).clone()
+        pos_mask = inputs["positive"]["attention_mask"].to(device).clone()
+        neg_ids = inputs["negative"]["input_ids"].to(device).clone()
+        neg_mask = inputs["negative"]["attention_mask"].to(device).clone()
+
+        source_emb = model(input_ids=src_ids, attention_mask=src_mask)
+        positive_emb = model(input_ids=pos_ids, attention_mask=pos_mask)
+        negative_emb = model(input_ids=neg_ids, attention_mask=neg_mask)
 
         loss = self.triplet_loss(source_emb, positive_emb, negative_emb)
-        if return_outputs: return loss, {"source_emb": source_emb, "positive_emb": positive_emb, "negative_emb": negative_emb}
+        if return_outputs:
+            return loss, {
+                "source_emb": source_emb,
+                "positive_emb": positive_emb,
+                "negative_emb": negative_emb,
+            }
         return loss
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        if output_dir is None: output_dir = self.args.output_dir
+        if output_dir is None:
+            output_dir = self.args.output_dir
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"Saving model checkpoint to {output_dir}")
 
         model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
-        if hasattr(model_to_save, 'save_pretrained'): model_to_save.save_pretrained(output_dir)
+        if hasattr(model_to_save, 'save_pretrained'):
+            model_to_save.save_pretrained(output_dir)
         else:
             logger.warning("Model does not have 'save_pretrained'. Saving state_dict directly.")
             torch.save(model_to_save.state_dict(), os.path.join(output_dir, "pytorch_model.bin"))
 
-        if self.tokenizer is not None: self.tokenizer.save_pretrained(output_dir)
+        if self.tokenizer is not None:
+            self.tokenizer.save_pretrained(output_dir)
         torch.save(self.args, os.path.join(output_dir, "training_args.bin"))
         logger.info(f"Full model and tokenizer saved to {output_dir}")
 
@@ -273,15 +349,20 @@ class SentenceTransformerTripletTrainer(Trainer):
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, CustomTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        model_args, data_args, training_args, custom_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, custom_args = parser.parse_json_file(
+            json_file=os.path.abspath(sys.argv[1])
+        )
     else:
         model_args, data_args, training_args, custom_args = parser.parse_args_into_dataclasses()
 
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
 
-    logger.info(f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
-                f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits: {training_args.fp16 or training_args.bf16}")
+    logger.info(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, "
+        f"n_gpu: {training_args.n_gpu}, distributed training: {bool(training_args.local_rank != -1)}, "
+        f"16-bits: {training_args.fp16 or training_args.bf16}"
+    )
     logger.info(f"Training/evaluation parameters:\n{training_args}")
     logger.info(f"Model arguments:\n{model_args}")
     logger.info(f"Data arguments:\n{data_args}")
@@ -290,20 +371,32 @@ def main():
     set_seed(training_args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name_or_path, cache_dir=model_args.cache_dir, trust_remote_code=model_args.trust_remote_code)
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        trust_remote_code=model_args.trust_remote_code
+    )
 
     model = SentenceTransformerModel(model_args.model_name_or_path, model_args)
     logger.info(f"Loaded SentenceTransformerModel with base model '{model_args.model_name_or_path}'.")
 
     train_dataset = TripletDataset(data_args, cache_dir=model_args.cache_dir)
     data_collator = TripletDataCollator(
-        tokenizer=tokenizer, max_length=data_args.max_seq_length or 512,
-        instruction=data_args.instruction_text or "", source_col=data_args.source_column,
-        positive_col=data_args.positive_column, negative_col=data_args.negative_column)
+        tokenizer=tokenizer,
+        max_length=data_args.max_seq_length or 512,
+        instruction=data_args.instruction_text or "",
+        source_col=data_args.source_column,
+        positive_col=data_args.positive_column,
+        negative_col=data_args.negative_column,
+    )
 
     trainer = SentenceTransformerTripletTrainer(
-        model=model, args=training_args, train_dataset=train_dataset,
-        data_collator=data_collator, tokenizer=tokenizer, margin=custom_args.margin)
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=data_collator,
+        tokenizer=tokenizer,
+        margin=custom_args.margin,
+    )
 
     try:
         logger.info("Starting model training...")
@@ -320,6 +413,7 @@ def main():
     except Exception as e:
         logger.error(f"An error occurred during training: {e}", exc_info=True)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
