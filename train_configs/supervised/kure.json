@@ -1,0 +1,32 @@
+{
+  "model_name_or_path": "nlpai-lab/KURE-v1",
+  "torch_dtype": "bfloat16",
+  "trust_remote_code": true,
+  "remove_unused_columns": false,
+  "dataset_name": "nmixx-fin/NMIXX_train",
+  "source_column": "source_text",
+  "positive_column": "positive",
+  "negative_column": "negative",
+  "instruction_text": "제시된 기준 문장과 의미가 가장 유사한 문장을 찾으세요.",
+  "max_seq_length": 2048,
+
+  "output_dir": "./output/kure_v1_finetuned",
+  "overwrite_output_dir": true,
+  "num_train_epochs": 1,
+  "per_device_train_batch_size": 8,
+  "gradient_accumulation_steps": 4,
+  "learning_rate": 5e-5,
+  "lr_scheduler_type": "cosine",
+  "warmup_ratio": 0.1,
+  "logging_dir": "./logs/kure_v1",
+  "logging_strategy": "steps",
+  "logging_steps": 10,
+  "save_strategy": "steps",
+  "save_steps": 1000,
+  "save_total_limit": 2,
+  "bf16": true,
+  "seed": 42,
+  "dataloader_num_workers": 4,
+
+  "margin": 1.0
+}
